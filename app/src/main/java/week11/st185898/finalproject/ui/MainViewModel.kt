@@ -75,6 +75,36 @@ class MainViewModel : ViewModel() {
         _authState.value = AuthState.SignedOut
     }
 
+    private fun observeFavorites() {
+        favListener?.remove()
+        favListener = favRepo.observeFavorites(
+            onSuccess = { _favorites.value = it },
+            onError = { _message.value = it.message ?: "Error loading favorites" }
+        )
+    }
+
+    fun addFavorite(name: String, desc: String, lat: Double, lon: Double) {
+        if (name.isBlank()) {
+            _message.value = "Name cannot be empty"
+            return
+        }
+        viewModelScope.launch {
+            favRepo.addFavorite(
+                FavoritePlace(name = name, description = desc, latitude = lat, longitude = lon)
+            ).onFailure { _message.value = it.message ?: "Failed to add favorite" }
+        }
+    }
+
+    fun deleteFavorite(id: String) {
+        viewModelScope.launch {
+            favRepo.deleteFavorite(id)
+                .onFailure { _message.value = it.message ?: "Failed to delete Favorite" }
+        }
+    }
+
+    fun clearMessage() {
+        _message.value = null
+    }
 
 
 }
