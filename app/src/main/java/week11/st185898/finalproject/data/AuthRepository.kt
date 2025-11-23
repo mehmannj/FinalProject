@@ -8,28 +8,55 @@ import kotlin.coroutines.resume
 class AuthRepository(
     private val auth: FirebaseAuth
 ) {
+
+    // Currently signed-in user (or null)
     val currentUser: FirebaseUser?
         get() = auth.currentUser
 
+    // SIGN UP: create a new user and return FirebaseUser in Result
     suspend fun signUp(email: String, password: String): Result<FirebaseUser> =
         suspendCancellableCoroutine { cont ->
             auth.createUserWithEmailAndPassword(email, password)
                 .addOnSuccessListener { result ->
-                    result.user?.let { cont.resume(Result.success(it)) }
-                        ?: cont.resume(Result.failure(IllegalStateException("User null")))
+                    val user = result.user
+                    if (user != null) {
+                        cont.resume(Result.success(user))
+                    } else {
+                        cont.resume(
+                            Result.failure(
+                                IllegalStateException("User is null after sign up")
+                            )
+                        )
+                    }
                 }
-                .addOnFailureListener { cont.resume(Result.failure(it)) }
+                .addOnFailureListener { e ->
+                    cont.resume(Result.failure(e))
+                }
         }
 
+    // SIGN IN: existing user login and return FirebaseUser in Result
     suspend fun signIn(email: String, password: String): Result<FirebaseUser> =
         suspendCancellableCoroutine { cont ->
             auth.signInWithEmailAndPassword(email, password)
                 .addOnSuccessListener { result ->
-                    result.user?.let { cont.resume(Result.success(it)) }
-                        ?: cont.resume(Result.failure(IllegalStateException("User null")))
+                    val user = result.user
+                    if (user != null) {
+                        cont.resume(Result.success(user))
+                    } else {
+                        cont.resume(
+                            Result.failure(
+                                IllegalStateException("User is null after sign in")
+                            )
+                        )
+                    }
                 }
-                .addOnFailureListener { cont.resume(Result.failure(it)) }
+                .addOnFailureListener { e ->
+                    cont.resume(Result.failure(e))
+                }
         }
 
-    fun signOut() = auth.signOut()
+    // SIGN OUT
+    fun signOut() {
+        auth.signOut()
+    }
 }

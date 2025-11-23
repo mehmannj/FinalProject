@@ -106,5 +106,9 @@ class MainViewModel : ViewModel() {
         _message.value = null
     }
 
-
+    override fun onCleared() {
+        super.onCleared()
+        favListener?.remove()
+        favListener = null
+    }
 }

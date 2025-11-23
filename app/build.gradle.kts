@@ -77,5 +77,8 @@ dependencies {
 
     // Icons
     implementation("androidx.compose.material:material-icons-extended")
+    
+    // ViewModel Compose
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
 }
