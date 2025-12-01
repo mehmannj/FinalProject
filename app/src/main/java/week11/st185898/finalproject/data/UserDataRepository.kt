@@ -13,6 +13,7 @@ class UserDataRepository(
     private val auth: FirebaseAuth,
     private val db: FirebaseFirestore
 ) {
+    
 
     private fun uid(): String =
         auth.currentUser?.uid ?: throw IllegalStateException("Not logged in")
