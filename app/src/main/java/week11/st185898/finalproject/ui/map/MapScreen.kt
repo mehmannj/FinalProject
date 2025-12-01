@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -66,6 +67,7 @@ import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.google.android.libraries.places.api.model.Place
 import com.google.android.libraries.places.api.net.FetchPlaceRequest
 import com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest
+import com.google.android.libraries.places.api.net.PlacesClient
 import week11.st185898.finalproject.ui.MainViewModel
 import week11.st185898.finalproject.ui.SmartCampusColors
 import week11.st185898.finalproject.ui.rememberMapViewWithLifecycle
@@ -87,31 +89,55 @@ fun MapScreen(
 
     var searchQuery by remember { mutableStateOf("") }
     var predictions by remember { mutableStateOf<List<AutocompletePrediction>>(emptyList()) }
-    var selectedCampus by remember { mutableStateOf("Traf") }  // matches your tab label
+    var selectedCampus by remember { mutableStateOf("Traf") }  // matches tab label
 
     var showSaveDialog by remember { mutableStateOf(false) }
 
     val fused = remember { LocationServices.getFusedLocationProviderClient(context) }
-    val places = remember { Places.createClient(context) }
+    var placesClient by remember { mutableStateOf<PlacesClient?>(null) }
 
     val permissionLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
-    // Request location
+    // Request location + initialize Places & client safely
     LaunchedEffect(Unit) {
+        // ---- Location permission & last known location ----
         val granted = ActivityCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
 
-        if (!granted) permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (!granted) {
+            permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
 
         fused.lastLocation.addOnSuccessListener {
             if (it != null) currentLocation = LatLng(it.latitude, it.longitude)
         }
+
+
+        // ---- Places initialization + client (read from AndroidManifest) ----
+        try {
+            val appInfo = context.packageManager.getApplicationInfo(
+                context.packageName,
+                PackageManager.GET_META_DATA
+            )
+            val apiKey = appInfo.metaData?.getString("com.google.android.geo.API_KEY")
+
+            if (apiKey.isNullOrBlank()) {
+                Log.w("MapScreen", "Google Maps API key missing in manifest meta-data.")
+            } else {
+                if (!Places.isInitialized()) {
+                    Places.initialize(context.applicationContext, apiKey)
+                }
+                placesClient = Places.createClient(context)
+            }
+        } catch (e: Exception) {
+            Log.e("MapScreen", "Failed to load Maps API key / initialize Places", e)
+        }
     }
 
-    // When we get currentLocation AND map is ready, center on user
+        // When we get currentLocation AND map is ready, center on user
     LaunchedEffect(currentLocation, mapReady) {
         if (!mapReady || currentLocation == null) return@LaunchedEffect
         googleMap?.animateCamera(
@@ -119,9 +145,10 @@ fun MapScreen(
         )
     }
 
-    // Autocomplete search
-    LaunchedEffect(searchQuery) {
-        if (searchQuery.length < 2) {
+    // Autocomplete search (only when PlacesClient is ready)
+    LaunchedEffect(searchQuery, placesClient) {
+        val client = placesClient
+        if (client == null || searchQuery.length < 2) {
             predictions = emptyList()
             return@LaunchedEffect
         }
@@ -130,8 +157,12 @@ fun MapScreen(
             .setQuery(searchQuery)
             .build()
 
-        places.findAutocompletePredictions(req)
+        client.findAutocompletePredictions(req)
             .addOnSuccessListener { predictions = it.autocompletePredictions }
+            .addOnFailureListener {
+                Log.e("MapScreen", "findAutocompletePredictions failed", it)
+                predictions = emptyList()
+            }
     }
 
     // ----------------- UI START -----------------
@@ -214,6 +245,16 @@ fun MapScreen(
             }
         }
 
+        // Optional helper text if Places didn’t init
+        if (placesClient == null) {
+            Text(
+                text = "Search suggestions may be disabled (Places not initialized).",
+                color = SmartCampusColors.TextSecondary,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 4.dp, start = 4.dp)
+            )
+        }
+
         // ---------- AUTOCOMPLETE LIST ----------
         if (predictions.isNotEmpty()) {
             Card(
@@ -226,21 +267,29 @@ fun MapScreen(
                         Column(
                             modifier = Modifier
                                 .clickable {
+                                    val client = placesClient ?: return@clickable
                                     val req = FetchPlaceRequest.newInstance(
                                         prediction.placeId,
                                         listOf(Place.Field.LAT_LNG, Place.Field.NAME)
                                     )
-                                    places.fetchPlace(req)
+                                    client.fetchPlace(req)
                                         .addOnSuccessListener { res ->
                                             val latLng = res.place.latLng
                                             if (latLng != null) {
                                                 selectedLocation = latLng
                                                 googleMap?.animateCamera(
-                                                    CameraUpdateFactory.newLatLngZoom(latLng, 16f)
+                                                    CameraUpdateFactory.newLatLngZoom(
+                                                        latLng,
+                                                        16f
+                                                    )
                                                 )
 
                                                 googleMap?.clear()
-                                                addCampusPins(googleMap, mapViewModel, selectedCampus)
+                                                addCampusPins(
+                                                    googleMap,
+                                                    mapViewModel,
+                                                    selectedCampus
+                                                )
                                                 googleMap?.addMarker(
                                                     MarkerOptions()
                                                         .position(latLng)
@@ -258,7 +307,10 @@ fun MapScreen(
                                 }
                                 .padding(12.dp)
                         ) {
-                            Text(prediction.getPrimaryText(null).toString(), color = Color.White)
+                            Text(
+                                prediction.getPrimaryText(null).toString(),
+                                color = Color.White
+                            )
                             Text(
                                 prediction.getSecondaryText(null).toString(),
                                 color = Color.LightGray,
@@ -281,12 +333,13 @@ fun MapScreen(
                 Button(
                     onClick = {
                         selectedCampus = campus
-                        selectedLocation = null           // clear previous selection
+                        selectedLocation = null
                         googleMap?.clear()
                         addCampusPins(googleMap, mapViewModel, campus)
                         googleMap?.animateCamera(
                             CameraUpdateFactory.newLatLngZoom(
-                                mapViewModel.getCampusCenter(campus), 16f
+                                mapViewModel.getCampusCenter(campus),
+                                16f
                             )
                         )
                     },
@@ -329,7 +382,7 @@ fun MapScreen(
                                 map.uiSettings.isZoomControlsEnabled = false
                                 map.uiSettings.isMyLocationButtonEnabled = true
 
-                                // Enable blue-dot location layer if permission granted
+                                // Enable blue dot if permission granted
                                 if (ActivityCompat.checkSelfPermission(
                                         ctx,
                                         Manifest.permission.ACCESS_FINE_LOCATION
@@ -342,17 +395,14 @@ fun MapScreen(
                                     map.isMyLocationEnabled = true
                                 }
 
-                                // Initial camera target: currentLocation if available, else campus center
                                 val initialTarget =
                                     currentLocation ?: mapViewModel.getCampusCenter(selectedCampus)
                                 map.moveCamera(
                                     CameraUpdateFactory.newLatLngZoom(initialTarget, 16f)
                                 )
 
-                                // add all pins for current campus
                                 addCampusPins(map, mapViewModel, selectedCampus)
 
-                                // Tap on map selects custom location
                                 map.setOnMapClickListener {
                                     selectedLocation = it
                                     map.addMarker(
@@ -367,7 +417,6 @@ fun MapScreen(
                                     )
                                 }
 
-                                // Tap on marker selects that pin
                                 map.setOnMarkerClickListener { marker ->
                                     selectedLocation = marker.position
                                     map.animateCamera(
@@ -375,7 +424,7 @@ fun MapScreen(
                                             marker.position, 17f
                                         )
                                     )
-                                    false // keep default info-window behavior
+                                    false
                                 }
                             }
                         }
@@ -383,7 +432,7 @@ fun MapScreen(
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // ---------- FLOATING NAVIGATION BUTTON (arrow) ----------
+                // FLOATING NAVIGATION BUTTON
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
@@ -410,7 +459,7 @@ fun MapScreen(
                     )
                 }
 
-                // ---------- RECENTER BUTTON (NEW) ----------
+                // RECENTER BUTTON
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)

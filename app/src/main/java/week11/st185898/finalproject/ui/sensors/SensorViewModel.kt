@@ -1,306 +1,133 @@
 package week11.st185898.finalproject.ui.sensors
 
-import android.app.Application
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
-import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import week11.st185898.finalproject.data.UserData
 import week11.st185898.finalproject.data.UserDataRepository
+import kotlin.math.max
+import kotlin.math.roundToInt
 
-class SensorViewModel(app: Application) : AndroidViewModel(app), SensorEventListener {
-    
+data class SensorUiState(
+    val stepsFromCounter: Float = 0f,
+    val stepsFromDetector: Float = 0f,
+    val initialCounterValue: Float = -1f,
+    val azimuthDegrees: Float = 0f
+) {
+    val displayedSteps: Int
+        get() = max(stepsFromCounter, stepsFromDetector).roundToInt()
+}
+
+class SensorViewModel : ViewModel() {
+
+    private val _uiState = MutableStateFlow(SensorUiState())
+    val uiState: StateFlow<SensorUiState> = _uiState
+
+    // --- NEW: history + repo ---
+    private val _history = MutableStateFlow<List<UserData>>(emptyList())
+    val history: StateFlow<List<UserData>> = _history
+
     private val userDataRepo = UserDataRepository(
         FirebaseAuth.getInstance(),
         FirebaseFirestore.getInstance()
     )
 
-    private val sensorManager =
-        app.getSystemService(Application.SENSOR_SERVICE) as SensorManager
+    // Track which date we are counting steps for
+    private var currentDate: String = userDataRepo.getTodayDateString()
 
-    private val stepDetector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
-    private val stepCounter = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
-    private val rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-    private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
-
-    private val _state = MutableStateFlow(SensorState())
-    val state: StateFlow<SensorState> = _state
-    
-    // For step counter (cumulative)
-    private var stepCountOffset = 0
-    private var lastStepCount = 0
-    
-    // For compass using accelerometer + magnetometer (fallback)
-    private val accelerometerReading = FloatArray(3)
-    private val magnetometerReading = FloatArray(3)
-    private var hasAccelerometerData = false
-    private var hasMagnetometerData = false
-    
-    // For Firestore persistence
-    private var lastSavedStepCount = 0
-    private var autoSaveJob: Job? = null
-    private val SAVE_INTERVAL_MS = 30_000L // Save every 30 seconds
-    private val SAVE_STEP_THRESHOLD = 10 // Save every 10 steps
-    
     init {
-        checkAndResetDaily()
-        loadStepCountFromFirestore()
-        startAutoSave()
-    }
-    
-    /**
-     * Check if date changed and reset step count if needed
-     */
-    private fun checkAndResetDaily() {
+        // Load today's saved steps + history when ViewModel is created
         viewModelScope.launch {
-            try {
-                val today = userDataRepo.getTodayDateString()
-                if (lastLoadedDate.isNotEmpty() && lastLoadedDate != today) {
-                    // New day - reset step count
-                    _state.emit(_state.value.copy(stepCount = 0))
-                    lastSavedStepCount = 0
-                    stepCountOffset = 0
-                    lastLoadedDate = today
-                } else if (lastLoadedDate.isEmpty()) {
-                    lastLoadedDate = today
+            // Load today's steps
+            userDataRepo.loadTodayStepCount()
+                .onSuccess { savedSteps ->
+                    _uiState.update { state ->
+                        state.copy(
+                            // we treat saved steps as coming from detector so UI shows them
+                            stepsFromDetector = savedSteps.toFloat()
+                        )
+                    }
                 }
-            } catch (e: IllegalStateException) {
-                // User not logged in
-            }
+                .onFailure {
+                    // ignore; start from 0 if error
+                }
+
+            // Load last 30 days history
+            refreshHistory()
         }
     }
-    
-    private var lastLoadedDate: String = ""
-    
-    /**
-     * Load step count from Firestore for today
-     * Resets if date changed (new day)
-     */
-    private fun loadStepCountFromFirestore() {
+
+    private suspend fun refreshHistory() {
+        userDataRepo.getAllStepData()
+            .onSuccess { list ->
+                _history.value = list
+            }
+            .onFailure {
+                // ignore for now
+            }
+    }
+
+    /** Helper: ensure we are still on same date; if not, reset daily steps. */
+    private fun checkDateAndResetIfNeeded() {
+        val today = userDataRepo.getTodayDateString()
+        if (today != currentDate) {
+            currentDate = today
+            // reset daily steps in UI
+            _uiState.value = SensorUiState()
+        }
+    }
+
+    /** Save current steps for "today" in Firestore. */
+    private fun persistSteps() {
+        val steps = _uiState.value.displayedSteps
         viewModelScope.launch {
-            try {
-                val today = userDataRepo.getTodayDateString()
-                
-                // If date changed, reset step count
-                if (lastLoadedDate.isNotEmpty() && lastLoadedDate != today) {
-                    _state.emit(_state.value.copy(stepCount = 0))
-                    lastSavedStepCount = 0
-                    stepCountOffset = 0
-                }
-                
-                lastLoadedDate = today
-                
-                userDataRepo.loadTodayStepCount()
-                    .onSuccess { savedCount ->
-                        if (savedCount > 0) {
-                            _state.emit(_state.value.copy(stepCount = savedCount))
-                            lastSavedStepCount = savedCount
-                        }
-                    }
-                    .onFailure {
-                        // Silently fail - user can still use the app
-                    }
-            } catch (e: IllegalStateException) {
-                // User not logged in - that's okay, steps will be saved when they log in
-            }
-        }
-    }
-    
-    /**
-     * Save step count to Firestore
-     */
-    private fun saveStepCountToFirestore(stepCount: Int) {
-        viewModelScope.launch {
-            try {
-                userDataRepo.saveStepCount(stepCount)
-                    .onSuccess {
-                        lastSavedStepCount = stepCount
-                    }
-                    .onFailure {
-                        // Silently fail - will retry on next save
-                    }
-            } catch (e: IllegalStateException) {
-                // User not logged in - skip saving
-            }
-        }
-    }
-    
-    /**
-     * Start auto-save job that saves steps periodically
-     */
-    private fun startAutoSave() {
-        autoSaveJob = viewModelScope.launch {
-            while (true) {
-                delay(SAVE_INTERVAL_MS)
-                val currentSteps = _state.value.stepCount
-                if (currentSteps != lastSavedStepCount) {
-                    saveStepCountToFirestore(currentSteps)
-                }
-            }
+            userDataRepo.saveStepCount(steps)
+            // also refresh history so Activity card updates
+            refreshHistory()
         }
     }
 
-    fun startListening() {
-        // Step detection - prefer TYPE_STEP_DETECTOR (fires per step)
-        stepDetector?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-        } ?: stepCounter?.let {
-            // Fallback to TYPE_STEP_COUNTER if detector not available
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-            lastStepCount = 0
-        }
-        
-        // Compass - prefer rotation vector
-        rotationVector?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-        } ?: run {
-            // Fallback to accelerometer + magnetometer
-            accelerometer?.let {
-                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-            }
-            magnetometer?.let {
-                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
-            }
-        }
-    }
+    /** Called whenever we get a TYPE_STEP_COUNTER value */
+    fun onStepCounter(rawTotal: Float) {
+        checkDateAndResetIfNeeded()
 
-    fun stopListening() {
-        sensorManager.unregisterListener(this)
-    }
-    
-    fun resetStepCount() {
-        viewModelScope.launch {
-            _state.emit(_state.value.copy(stepCount = 0))
-            stepCountOffset = 0
-            lastStepCount = 0
-            lastSavedStepCount = 0
-            // Save reset to Firestore
-            saveStepCountToFirestore(0)
-        }
-    }
+        _uiState.update { state ->
+            val baseline =
+                if (state.initialCounterValue < 0f) rawTotal else state.initialCounterValue
+            val steps = (rawTotal - baseline).coerceAtLeast(0f)
 
-    override fun onSensorChanged(event: SensorEvent?) {
-        if (event == null) return
-
-        when (event.sensor.type) {
-            Sensor.TYPE_STEP_DETECTOR -> {
-                // Fires once per step detected
-                if (event.values.isNotEmpty() && event.values[0] == 1.0f) {
-                    viewModelScope.launch {
-                        val newCount = _state.value.stepCount + 1
-                        _state.emit(_state.value.copy(stepCount = newCount))
-                        
-                        // Save to Firestore if threshold reached
-                        if (newCount - lastSavedStepCount >= SAVE_STEP_THRESHOLD) {
-                            saveStepCountToFirestore(newCount)
-                        }
-                    }
-                }
-            }
-            
-            Sensor.TYPE_STEP_COUNTER -> {
-                // Cumulative step count since last reboot
-                if (event.values.isNotEmpty()) {
-                    val totalSteps = event.values[0].toInt()
-                    if (stepCountOffset == 0) {
-                        // First reading - set offset
-                        stepCountOffset = totalSteps
-                        lastStepCount = totalSteps
-                    } else {
-                        // Calculate steps since app started
-                        val stepsSinceStart = totalSteps - stepCountOffset
-                        if (stepsSinceStart > _state.value.stepCount) {
-                            viewModelScope.launch {
-                                _state.emit(_state.value.copy(stepCount = stepsSinceStart))
-                                
-                                // Save to Firestore if threshold reached
-                                if (stepsSinceStart - lastSavedStepCount >= SAVE_STEP_THRESHOLD) {
-                                    saveStepCountToFirestore(stepsSinceStart)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Sensor.TYPE_ROTATION_VECTOR -> {
-                // Primary method for compass - most accurate
-                val rotationMatrix = FloatArray(9)
-                val orientationAngles = FloatArray(3)
-
-                try {
-                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
-
-                    var azimuthDeg = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
-                    if (azimuthDeg < 0) azimuthDeg += 360f
-
-                    viewModelScope.launch {
-                        _state.emit(_state.value.copy(azimuth = azimuthDeg))
-                    }
-                } catch (e: Exception) {
-                    // Handle invalid rotation vector data
-                }
-            }
-            
-            Sensor.TYPE_ACCELEROMETER -> {
-                // Fallback compass method - part 1
-                System.arraycopy(event.values, 0, accelerometerReading, 0, 3)
-                hasAccelerometerData = true
-                calculateCompassFromAccelMag()
-            }
-            
-            Sensor.TYPE_MAGNETIC_FIELD -> {
-                // Fallback compass method - part 2
-                System.arraycopy(event.values, 0, magnetometerReading, 0, 3)
-                hasMagnetometerData = true
-                calculateCompassFromAccelMag()
-            }
-        }
-    }
-    
-    private fun calculateCompassFromAccelMag() {
-        if (hasAccelerometerData && hasMagnetometerData) {
-            val rotationMatrix = FloatArray(9)
-            val orientationAngles = FloatArray(3)
-            
-            val success = SensorManager.getRotationMatrix(
-                rotationMatrix, null, accelerometerReading, magnetometerReading
+            state.copy(
+                initialCounterValue = baseline,
+                stepsFromCounter = steps
             )
-            
-            if (success) {
-                SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                var azimuthDeg = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
-                if (azimuthDeg < 0) azimuthDeg += 360f
-                
-                viewModelScope.launch {
-                    _state.emit(_state.value.copy(azimuth = azimuthDeg))
-                }
-            }
         }
+
+        // Save to Firestore for today
+        persistSteps()
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
-    
-    override fun onCleared() {
-        super.onCleared()
-        stopListening()
-        autoSaveJob?.cancel()
-        // Final save before clearing
-        val finalStepCount = _state.value.stepCount
-        if (finalStepCount != lastSavedStepCount) {
-            viewModelScope.launch {
-                saveStepCountToFirestore(finalStepCount)
-            }
+    /** Called whenever we get a TYPE_STEP_DETECTOR event */
+    fun onStepDetected() {
+        checkDateAndResetIfNeeded()
+
+        _uiState.update { state ->
+            state.copy(stepsFromDetector = state.stepsFromDetector + 1f)
+        }
+
+        // Save to Firestore for today
+        persistSteps()
+    }
+
+    /** Called with azimuth (degrees) from the compass sensor */
+    fun onAzimuthChanged(degrees: Float) {
+        val normalized = ((degrees + 360f) % 360f)
+        _uiState.update { state ->
+            state.copy(azimuthDegrees = normalized)
         }
     }
 }
